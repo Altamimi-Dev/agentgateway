@@ -11,8 +11,12 @@
 //!    contiguously by at least one evaluation.
 //! 3. **Pass** → the held frames are flushed to the client and buffering resumes.
 //!    **Block** → the held (never-forwarded) frames are discarded and a synthetic
-//!    SSE error event is emitted. Content flushed by earlier passing windows
-//!    cannot be retracted — an accepted accuracy/latency tradeoff.
+//!    SSE error event is emitted. **Mask** → the held frames' text-bearing events
+//!    are collapsed into a single synthetic delta carrying the redacted window
+//!    text, and non-text events (role deltas, tool calls, usage, `[DONE]`) are
+//!    replayed unchanged. Content flushed by earlier passing windows cannot be
+//!    retracted or redacted — an accepted accuracy/latency tradeoff shared by
+//!    both Block and Mask.
 //!
 //! This is not 100% accurate: a guard that needs full-response context, or a
 //! pattern spanning more than the overlap window, can be missed.
@@ -24,11 +28,11 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use ::http::HeaderMap;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http_body::Frame;
 use pin_project_lite::pin_project;
-use tokio_sse_codec::{Event, Frame as SseFrame, SseDecoder};
-use tokio_util::codec::Decoder;
+use tokio_sse_codec::{Event, Frame as SseFrame, SseDecoder, SseEncoder};
+use tokio_util::codec::{Decoder, Encoder};
 use tracing::warn;
 
 use super::{
@@ -59,22 +63,47 @@ pub fn tail_chars(s: &str, max_bytes: usize) -> &str {
 	&s[start..]
 }
 
-/// Run all evaluators against a window. Returns the rejection body if any evaluator blocked.
-pub async fn evaluate_window(
+/// Aggregate outcome of running every evaluator against one window.
+///
+/// This is a superset of the plain `Option<Bytes>` that `evaluate_window` returns:
+/// the SSE path (`GuardedSseBody`) can act on `Masked`, while the realtime
+/// WebSocket path only distinguishes `Blocked` from everything else.
+pub enum WindowOutcome {
+	/// No evaluator blocked or masked the window.
+	Pass,
+	/// An evaluator blocked the window; rejection body to encode for the stream.
+	Blocked(Bytes),
+	/// An evaluator masked the window; the window text after redaction, chained
+	/// through any remaining evaluators the same way buffered response guards
+	/// chain mutations across multiple configured guards.
+	Masked(String),
+}
+
+/// Run all evaluators against a window, chaining `Masked` output into the window
+/// text seen by later evaluators. Returns the aggregate outcome.
+pub async fn evaluate_window_outcome(
 	evaluators: &mut [Box<dyn StreamingEvaluator>],
 	window: &str,
-) -> Option<Bytes> {
+) -> WindowOutcome {
+	let mut current = window.to_string();
+	let mut masked = false;
 	for ev in evaluators.iter_mut() {
-		match ev.evaluate(window).await {
+		match ev.evaluate(&current).await {
 			Ok(Some(StreamingGuardrailOutcome::Blocked(body))) => {
 				tracing::debug!("streaming guardrail blocked response window");
-				return Some(body);
+				return WindowOutcome::Blocked(body);
+			},
+			Ok(Some(StreamingGuardrailOutcome::Masked(text))) => {
+				current = text;
+				masked = true;
 			},
 			Ok(None) => {},
 			Err(e) => match ev.failure_mode() {
 				FailureMode::FailClosed => {
 					warn!("streaming guardrail error, failing closed: {e}");
-					return Some(Bytes::from_static(b"Content blocked by guardrail policy"));
+					return WindowOutcome::Blocked(Bytes::from_static(
+						b"Content blocked by guardrail policy",
+					));
 				},
 				FailureMode::FailOpen => {
 					warn!("streaming guardrail error, failing open: {e}");
@@ -82,7 +111,25 @@ pub async fn evaluate_window(
 			},
 		}
 	}
-	None
+	if masked {
+		WindowOutcome::Masked(current)
+	} else {
+		WindowOutcome::Pass
+	}
+}
+
+/// Run all evaluators against a window. Returns the rejection body if any evaluator blocked.
+///
+/// Used by the realtime WebSocket path, which cannot rewrite frames in place: a
+/// `Masked` outcome is treated the same as `Pass`.
+pub async fn evaluate_window(
+	evaluators: &mut [Box<dyn StreamingEvaluator>],
+	window: &str,
+) -> Option<Bytes> {
+	match evaluate_window_outcome(evaluators, window).await {
+		WindowOutcome::Blocked(body) => Some(body),
+		WindowOutcome::Pass | WindowOutcome::Masked(_) => None,
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -152,7 +199,7 @@ fn guardrail_blocked_sse_bytes(body: Bytes) -> Bytes {
 }
 
 type EvalFuture =
-	Pin<Box<dyn Future<Output = (Vec<Box<dyn StreamingEvaluator>>, Option<Bytes>)> + Send + 'static>>;
+	Pin<Box<dyn Future<Output = (Vec<Box<dyn StreamingEvaluator>>, WindowOutcome)> + Send + 'static>>;
 
 /// Internal state machine for `GuardedSseBody`.
 enum GuardedBodyState {
@@ -179,6 +226,10 @@ pin_project! {
 		buffer_limit: usize,
 		held_frames: Vec<Bytes>,
 		held_bytes: usize,
+		// Decoded SSE frames for the current batch, in order, kept alongside
+		// `held_frames`'s raw bytes so a `Masked` outcome can replay non-text
+		// frames unchanged and collapse text-delta frames into one synthetic event.
+		held_events: Vec<SseFrame<Bytes>>,
 		pending_text: String,
 		overlap_tail: String,
 		sse_decoder: SseDecoder<Bytes>,
@@ -229,6 +280,7 @@ impl GuardedSseBody {
 			buffer_limit,
 			held_frames: Vec::new(),
 			held_bytes: 0,
+			held_events: Vec::new(),
 			pending_text: String::new(),
 			overlap_tail: String::new(),
 			sse_decoder: SseDecoder::with_max_size(buffer_limit),
@@ -238,64 +290,136 @@ impl GuardedSseBody {
 		})
 	}
 
-	/// Extract text delta from a parsed SSE frame if present.
-	fn extract_text_delta(frame: SseFrame<Bytes>) -> Option<String> {
+	/// Classify a parsed SSE frame as a recognized text delta, returning its wire
+	/// format (for masked re-encoding) and text. Used both to accumulate
+	/// `pending_text` and, on a `Masked` outcome, by `build_masked_queue`.
+	fn classify_delta(frame: &SseFrame<Bytes>) -> Option<(DeltaFormat, String)> {
 		let SseFrame::Event(Event { data, .. }) = frame else {
 			return None;
 		};
 		if data.as_ref() == b"[DONE]" {
 			return None;
 		}
-		if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&data) {
-			// OpenAI responses: response.output_text.delta
-			if v.get("type").and_then(|t| t.as_str()) == Some("response.output_text.delta")
-				&& let Some(text) = v.get("delta").and_then(|s| s.as_str())
-			{
-				return Some(text.to_string());
-			}
-			// OpenAI completions: choices[0].delta.content
-			if let Some(text) = v
-				.get("choices")
-				.and_then(|c| c.get(0))
-				.and_then(|c| c.get("delta"))
-				.and_then(|d| d.get("content"))
-				.and_then(|s| s.as_str())
-			{
-				return Some(text.to_string());
-			}
-			// Anthropic messages: delta.text
-			if let Some(text) = v
-				.get("delta")
-				.and_then(|d| d.get("text"))
-				.and_then(|s| s.as_str())
-			{
-				return Some(text.to_string());
-			}
-			// Native Gemini: candidates[].content.parts[].text. `candidateCount` is client
-			// controlled, so reading only candidates[0] would let the client hide text from the
-			// guard in a second candidate. Concatenating every candidate is the conservative
-			// choice: the guard evaluates one text stream, and a window that contains all
-			// candidates can only match more than one that contains a subset — every substring of
-			// a single candidate is still contiguous in the concatenation. Thought parts are
-			// excluded, as they are on the non-streaming path (types::gemini::candidate_text).
-			if let Some(candidates) = v.get("candidates").and_then(|c| c.as_array()) {
-				return Some(
-					candidates
-						.iter()
-						.filter_map(|c| {
-							c.get("content")
-								.and_then(|c| c.get("parts"))
-								.and_then(|p| p.as_array())
-						})
-						.flatten()
-						.filter(|p| p.get("thought").and_then(serde_json::Value::as_bool) != Some(true))
-						.filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-						.collect(),
-				);
-			}
+		let v = serde_json::from_slice::<serde_json::Value>(data).ok()?;
+		// OpenAI responses: response.output_text.delta
+		if v.get("type").and_then(|t| t.as_str()) == Some("response.output_text.delta")
+			&& let Some(text) = v.get("delta").and_then(|s| s.as_str())
+		{
+			return Some((DeltaFormat::OpenAiResponses, text.to_string()));
+		}
+		// OpenAI completions: choices[0].delta.content
+		if let Some(text) = v
+			.get("choices")
+			.and_then(|c| c.get(0))
+			.and_then(|c| c.get("delta"))
+			.and_then(|d| d.get("content"))
+			.and_then(|s| s.as_str())
+		{
+			return Some((DeltaFormat::OpenAiCompletions, text.to_string()));
+		}
+		// Anthropic messages: delta.text
+		if let Some(text) = v
+			.get("delta")
+			.and_then(|d| d.get("text"))
+			.and_then(|s| s.as_str())
+		{
+			return Some((DeltaFormat::Anthropic, text.to_string()));
+		}
+		// Native Gemini: candidates[].content.parts[].text. `candidateCount` is client
+		// controlled, so reading only candidates[0] would let the client hide text from the
+		// guard in a second candidate. Concatenating every candidate is the conservative
+		// choice: the guard evaluates one text stream, and a window that contains all
+		// candidates can only match more than one that contains a subset — every substring of
+		// a single candidate is still contiguous in the concatenation. Thought parts are
+		// excluded, as they are on the non-streaming path (types::gemini::candidate_text).
+		if let Some(candidates) = v.get("candidates").and_then(|c| c.as_array()) {
+			let text: String = candidates
+				.iter()
+				.filter_map(|c| {
+					c.get("content")
+						.and_then(|c| c.get("parts"))
+						.and_then(|p| p.as_array())
+				})
+				.flatten()
+				.filter(|p| p.get("thought").and_then(serde_json::Value::as_bool) != Some(true))
+				.filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+				.collect();
+			return Some((DeltaFormat::Gemini, text));
 		}
 		None
 	}
+
+	/// Replace the text-delta frames in `events` with a single synthetic delta
+	/// carrying `masked_text`, replaying every non-text frame unchanged and in
+	/// order. `masked_text` covers the whole evaluated window (overlap tail plus
+	/// new batch): if the overlap tail's own text was left unmodified by the
+	/// mask, it is resent verbatim here — the same "can't retract already-flushed
+	/// bytes" tradeoff already accepted for Block.
+	fn build_masked_queue(events: Vec<SseFrame<Bytes>>, masked_text: &str) -> VecDeque<Bytes> {
+		let mut encoder = SseEncoder::new();
+		let mut queue = VecDeque::with_capacity(events.len());
+		let mut masked_emitted = false;
+		for frame in events {
+			let format = Self::classify_delta(&frame).map(|(format, _)| format);
+			let frame = match format {
+				Some(format) if !masked_emitted => {
+					masked_emitted = true;
+					encode_masked_delta(format, masked_text)
+				},
+				Some(_) => continue,
+				None => frame,
+			};
+			let mut buf = BytesMut::new();
+			encoder
+				.encode(frame, &mut buf)
+				.expect("SseEncoder::encode never fails for a well-formed Frame<Bytes>");
+			queue.push_back(buf.freeze());
+		}
+		queue
+	}
+}
+
+/// Wire shapes `classify_delta` recognizes, used to re-encode a masked window
+/// back into the format the client expects.
+#[derive(Clone, Copy)]
+enum DeltaFormat {
+	OpenAiCompletions,
+	OpenAiResponses,
+	Anthropic,
+	Gemini,
+}
+
+/// Build a synthetic delta-shaped SSE frame carrying `masked_text`, matching
+/// the wire format `classify_delta` detected for the frames it replaces.
+fn encode_masked_delta(format: DeltaFormat, masked_text: &str) -> SseFrame<Bytes> {
+	let (name, data) = match format {
+		DeltaFormat::OpenAiCompletions => (
+			"message",
+			serde_json::json!({ "choices": [{ "index": 0, "delta": { "content": masked_text } }] }),
+		),
+		DeltaFormat::OpenAiResponses => (
+			"response.output_text.delta",
+			serde_json::json!({ "type": "response.output_text.delta", "delta": masked_text }),
+		),
+		DeltaFormat::Anthropic => (
+			"content_block_delta",
+			serde_json::json!({
+				"type": "content_block_delta",
+				"delta": { "type": "text_delta", "text": masked_text },
+			}),
+		),
+		DeltaFormat::Gemini => (
+			"message",
+			serde_json::json!({
+				"candidates": [{ "content": { "parts": [{ "text": masked_text }] } }],
+			}),
+		),
+	};
+	SseFrame::Event(Event {
+		id: None,
+		name: name.into(),
+		data: Bytes::from(data.to_string()),
+	})
 }
 
 impl http_body::Body for GuardedSseBody {
@@ -342,16 +466,28 @@ impl http_body::Body for GuardedSseBody {
 				// -----------------------------------------------------------------
 				GuardedBodyState::Evaluating { fut, eof } => match fut.as_mut().poll(cx) {
 					Poll::Pending => return Poll::Pending,
-					Poll::Ready((evaluators, blocked_body)) => {
+					Poll::Ready((evaluators, outcome)) => {
 						*this.evaluators = evaluators;
-						if let Some(body) = blocked_body {
-							this.held_frames.clear();
-							*this.held_bytes = 0;
-							*this.state = GuardedBodyState::Blocked(body);
-						} else {
-							let queue: VecDeque<Bytes> = this.held_frames.drain(..).collect();
-							*this.held_bytes = 0;
-							*this.state = GuardedBodyState::Flushing { queue, eof: *eof };
+						match outcome {
+							WindowOutcome::Blocked(body) => {
+								this.held_frames.clear();
+								this.held_events.clear();
+								*this.held_bytes = 0;
+								*this.state = GuardedBodyState::Blocked(body);
+							},
+							WindowOutcome::Masked(masked_text) => {
+								this.held_frames.clear();
+								let events = std::mem::take(this.held_events);
+								let queue = GuardedSseBody::build_masked_queue(events, &masked_text);
+								*this.held_bytes = 0;
+								*this.state = GuardedBodyState::Flushing { queue, eof: *eof };
+							},
+							WindowOutcome::Pass => {
+								let queue: VecDeque<Bytes> = this.held_frames.drain(..).collect();
+								this.held_events.clear();
+								*this.held_bytes = 0;
+								*this.state = GuardedBodyState::Flushing { queue, eof: *eof };
+							},
 						}
 					},
 				},
@@ -375,9 +511,10 @@ impl http_body::Body for GuardedSseBody {
 							loop {
 								match this.sse_decoder.decode(this.decode_buffer) {
 									Ok(Some(sse_frame)) => {
-										if let Some(delta) = GuardedSseBody::extract_text_delta(sse_frame) {
+										if let Some((_, delta)) = GuardedSseBody::classify_delta(&sse_frame) {
 											this.pending_text.push_str(&delta);
 										}
+										this.held_events.push(sse_frame);
 									},
 									Ok(None) => break,
 									Err(e) => {
@@ -398,6 +535,7 @@ impl http_body::Body for GuardedSseBody {
 								// In that case, flush the buffer as-is without evaluation, to avoid stalling on unprocessable content.
 								if this.pending_text.is_empty() {
 									let queue: VecDeque<Bytes> = this.held_frames.drain(..).collect();
+									this.held_events.clear();
 									*this.held_bytes = 0;
 									*this.state = GuardedBodyState::Flushing { queue, eof: false };
 									continue;
@@ -407,8 +545,8 @@ impl http_body::Body for GuardedSseBody {
 								*this.overlap_tail = tail_chars(&window, OVERLAP_BYTES).to_string();
 								let mut evaluators = std::mem::take(this.evaluators);
 								let fut: EvalFuture = Box::pin(async move {
-									let blocked_body = evaluate_window(&mut evaluators, &window).await;
-									(evaluators, blocked_body)
+									let outcome = evaluate_window_outcome(&mut evaluators, &window).await;
+									(evaluators, outcome)
 								});
 								*this.state = GuardedBodyState::Evaluating { fut, eof: false };
 							}
@@ -417,9 +555,10 @@ impl http_body::Body for GuardedSseBody {
 							loop {
 								match this.sse_decoder.decode_eof(this.decode_buffer) {
 									Ok(Some(sse_frame)) => {
-										if let Some(delta) = GuardedSseBody::extract_text_delta(sse_frame) {
+										if let Some((_, delta)) = GuardedSseBody::classify_delta(&sse_frame) {
 											this.pending_text.push_str(&delta);
 										}
+										this.held_events.push(sse_frame);
 									},
 									Ok(None) => break,
 									Err(e) => {
@@ -432,6 +571,7 @@ impl http_body::Body for GuardedSseBody {
 
 							if this.pending_text.is_empty() {
 								let queue: VecDeque<Bytes> = this.held_frames.drain(..).collect();
+								this.held_events.clear();
 								*this.held_bytes = 0;
 								*this.state = GuardedBodyState::Flushing { queue, eof: true };
 								continue;
@@ -442,8 +582,8 @@ impl http_body::Body for GuardedSseBody {
 							this.overlap_tail.clear();
 							let mut evaluators = std::mem::take(this.evaluators);
 							let fut: EvalFuture = Box::pin(async move {
-								let blocked_body = evaluate_window(&mut evaluators, &window).await;
-								(evaluators, blocked_body)
+								let outcome = evaluate_window_outcome(&mut evaluators, &window).await;
+								(evaluators, outcome)
 							});
 							*this.state = GuardedBodyState::Evaluating { fut, eof: true };
 						},
@@ -459,6 +599,7 @@ mod tests {
 	use http_body_util::BodyExt as _;
 
 	use super::*;
+	use crate::llm::policy::{Action, RegexRule, RegexRules, RequestRejection};
 
 	struct PassEvaluator;
 
@@ -668,11 +809,12 @@ mod tests {
 	}
 
 	fn text_delta(chunk: serde_json::Value) -> Option<String> {
-		GuardedSseBody::extract_text_delta(SseFrame::Event(Event {
+		GuardedSseBody::classify_delta(&SseFrame::Event(Event {
 			id: None,
 			name: "message".into(),
 			data: Bytes::from(chunk.to_string()),
 		}))
+		.map(|(_, text)| text)
 	}
 
 	#[test]
@@ -826,5 +968,199 @@ mod tests {
 			mode: FailureMode::FailOpen,
 		})];
 		assert!(evaluate_window(&mut evs, "some text").await.is_none());
+	}
+
+	fn mask_evaluator(pattern: &str) -> Box<dyn StreamingEvaluator> {
+		let guard = ResponseGuard {
+			rejection: RequestRejection::default(),
+			kind: ResponseGuardKind::Regex(RegexRules {
+				action: Action::Mask,
+				rules: vec![RegexRule::Regex {
+					pattern: regex::Regex::new(pattern).unwrap(),
+				}],
+			}),
+		};
+		make_evaluator(
+			&guard,
+			crate::test_helpers::policy_client(),
+			HeaderMap::new(),
+			None,
+		)
+	}
+
+	fn reject_evaluator(pattern: &str) -> Box<dyn StreamingEvaluator> {
+		let guard = ResponseGuard {
+			rejection: RequestRejection::default(),
+			kind: ResponseGuardKind::Regex(RegexRules {
+				action: Action::Reject,
+				rules: vec![RegexRule::Regex {
+					pattern: regex::Regex::new(pattern).unwrap(),
+				}],
+			}),
+		};
+		make_evaluator(
+			&guard,
+			crate::test_helpers::policy_client(),
+			HeaderMap::new(),
+			None,
+		)
+	}
+
+	fn responses_delta_bytes(text: &str) -> Bytes {
+		sse_bytes(
+			&serde_json::json!({ "type": "response.output_text.delta", "delta": text }).to_string(),
+		)
+	}
+
+	fn anthropic_delta_bytes(text: &str) -> Bytes {
+		sse_bytes(
+			&serde_json::json!({
+				"type": "content_block_delta",
+				"delta": { "type": "text_delta", "text": text },
+			})
+			.to_string(),
+		)
+	}
+
+	/// Parse the collected bytes as SSE `data:` lines and return the JSON payload
+	/// of the (only) event carrying the masked text.
+	fn extract_masked_event_json(bytes: &[u8]) -> serde_json::Value {
+		let text = std::str::from_utf8(bytes).unwrap();
+		text
+			.lines()
+			.filter_map(|line| line.strip_prefix("data: "))
+			.find_map(|payload| {
+				let v: serde_json::Value = serde_json::from_str(payload).ok()?;
+				contains(payload.as_bytes(), b"<masked>").then_some(v)
+			})
+			.expect("masked delta event present in output")
+	}
+
+	// The issue's payload: a leaked GitLab personal access token embedded in
+	// otherwise ordinary assistant text, across the three delta shapes
+	// `classify_delta` re-encodes on a Masked outcome.
+	// concat! keeps this synthetic token from appearing as one contiguous
+	// literal in source, which GitHub's push-protection secret scanner flags
+	// as a real GitLab PAT.
+	const LEAKED_TOKEN: &str = concat!("glpat-", "1a2B3c4D5e6F7g8H9i0J");
+	const LEAKED_TOKEN_PATTERN: &str = r"glpat-[A-Za-z0-9_-]{10,}";
+
+	#[tokio::test]
+	async fn test_mask_redacts_openai_completions_delta() {
+		let chunk = delta_bytes(&format!("here is a token: {LEAKED_TOKEN} enjoy"));
+		let done = sse_bytes("[DONE]");
+		let body = make_body(vec![chunk, done]);
+
+		let guarded = GuardedSseBody::new(
+			body,
+			vec![mask_evaluator(LEAKED_TOKEN_PATTERN)],
+			1024 * 1024,
+			None,
+		);
+
+		let bytes = guarded.collect().await.unwrap().to_bytes();
+		assert!(!contains(&bytes, LEAKED_TOKEN.as_bytes()));
+		assert!(contains(&bytes, b"<masked>"));
+		assert!(!contains(&bytes, b"guardrail_blocked"));
+
+		let parsed = extract_masked_event_json(&bytes);
+		assert!(
+			parsed["choices"][0]["delta"]["content"]
+				.as_str()
+				.unwrap()
+				.contains("<masked>")
+		);
+	}
+
+	#[tokio::test]
+	async fn test_mask_redacts_openai_responses_delta() {
+		let chunk = responses_delta_bytes(&format!("here is a token: {LEAKED_TOKEN} enjoy"));
+		let done = sse_bytes("[DONE]");
+		let body = make_body(vec![chunk, done]);
+
+		let guarded = GuardedSseBody::new(
+			body,
+			vec![mask_evaluator(LEAKED_TOKEN_PATTERN)],
+			1024 * 1024,
+			None,
+		);
+
+		let bytes = guarded.collect().await.unwrap().to_bytes();
+		assert!(!contains(&bytes, LEAKED_TOKEN.as_bytes()));
+		assert!(contains(&bytes, b"<masked>"));
+		assert!(!contains(&bytes, b"guardrail_blocked"));
+
+		let parsed = extract_masked_event_json(&bytes);
+		assert_eq!(parsed["type"], "response.output_text.delta");
+		assert!(parsed["delta"].as_str().unwrap().contains("<masked>"));
+	}
+
+	#[tokio::test]
+	async fn test_mask_redacts_anthropic_delta() {
+		let chunk = anthropic_delta_bytes(&format!("here is a token: {LEAKED_TOKEN} enjoy"));
+		let done = sse_bytes("[DONE]");
+		let body = make_body(vec![chunk, done]);
+
+		let guarded = GuardedSseBody::new(
+			body,
+			vec![mask_evaluator(LEAKED_TOKEN_PATTERN)],
+			1024 * 1024,
+			None,
+		);
+
+		let bytes = guarded.collect().await.unwrap().to_bytes();
+		assert!(!contains(&bytes, LEAKED_TOKEN.as_bytes()));
+		assert!(contains(&bytes, b"<masked>"));
+		assert!(!contains(&bytes, b"guardrail_blocked"));
+
+		let parsed = extract_masked_event_json(&bytes);
+		assert_eq!(parsed["type"], "content_block_delta");
+		assert!(
+			parsed["delta"]["text"]
+				.as_str()
+				.unwrap()
+				.contains("<masked>")
+		);
+	}
+
+	#[tokio::test]
+	async fn test_mask_replays_non_text_frames_unchanged() {
+		let role_frame = sse_bytes(r#"{"choices":[{"delta":{"role":"assistant"}}]}"#);
+		let text_frame = delta_bytes(&format!("token {LEAKED_TOKEN} here"));
+		let done = sse_bytes("[DONE]");
+		let body = make_body(vec![role_frame, text_frame, done]);
+
+		let guarded = GuardedSseBody::new(
+			body,
+			vec![mask_evaluator(LEAKED_TOKEN_PATTERN)],
+			1024 * 1024,
+			None,
+		);
+
+		let bytes = guarded.collect().await.unwrap().to_bytes();
+		assert!(contains(&bytes, b"\"role\":\"assistant\""));
+		assert!(!contains(&bytes, LEAKED_TOKEN.as_bytes()));
+		assert!(contains(&bytes, b"<masked>"));
+	}
+
+	// Reject case: with a mask-action evaluator now supported, a reject-action
+	// regex guard on the same secret must still block and byte-for-byte match
+	// the pre-existing Block behavior (no leaked secret, synthetic error event).
+	#[tokio::test]
+	async fn test_reject_still_blocks_when_masking_is_available() {
+		let chunk = delta_bytes(&format!("here is a token: {LEAKED_TOKEN} enjoy"));
+		let done = sse_bytes("[DONE]");
+		let body = make_body(vec![chunk, done]);
+
+		let guarded = GuardedSseBody::new(
+			body,
+			vec![reject_evaluator(LEAKED_TOKEN_PATTERN)],
+			1024 * 1024,
+			None,
+		);
+
+		let bytes = guarded.collect().await.unwrap().to_bytes();
+		assert!(contains(&bytes, b"guardrail_blocked"));
+		assert!(!contains(&bytes, LEAKED_TOKEN.as_bytes()));
 	}
 }

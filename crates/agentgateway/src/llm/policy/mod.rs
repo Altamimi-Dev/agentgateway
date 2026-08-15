@@ -370,6 +370,9 @@ pub trait StreamingEvaluator: Send {
 pub enum StreamingGuardrailOutcome {
 	/// Content was blocked; include the rejection body to encode for the stream.
 	Blocked(Bytes),
+	/// Content was masked; carries the window text (overlap tail plus new batch)
+	/// after redaction, chained through any earlier evaluators.
+	Masked(String),
 }
 
 struct TextResponse {
@@ -580,11 +583,7 @@ impl PromptGuard {
 				Ok(Some(StreamingGuardrailOutcome::Blocked(body)))
 			},
 			None if action == GuardrailAction::Mask => {
-				debug_assert!(
-					false,
-					"streaming response guard unexpectedly returned Masked; streaming masking is not supported"
-				);
-				Ok(None)
+				Ok(Some(StreamingGuardrailOutcome::Masked(resp.content)))
 			},
 			None => Ok(None),
 		}

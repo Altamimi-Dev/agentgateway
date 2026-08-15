@@ -2427,6 +2427,141 @@ async fn process_streaming_bedrock_completions_normalizes_sse_headers_and_done()
 	);
 }
 
+/// Integration smoke for issue #2956: a response `promptGuard` regex-mask
+/// rule must redact a leaked secret through the real `process_response`
+/// dispatcher, for both the buffered (non-streaming) and SSE (streaming)
+/// paths, driven by the same `LLMResponsePolicies`.
+#[tokio::test]
+async fn process_response_masks_leaked_secret_streamed_and_non_streamed() {
+	use crate::llm::policy::{Action, RegexRule, RegexRules, ResponseGuard, ResponseGuardKind};
+	use crate::proxy::httpproxy::PolicyClient;
+	use crate::test_helpers::proxymock::setup_proxy_test;
+
+	// concat! keeps this synthetic token from appearing as one contiguous
+	// literal in source, which GitHub's push-protection secret scanner flags
+	// as a real GitLab PAT.
+	const LEAKED_TOKEN: &str = concat!("glpat-", "1a2B3c4D5e6F7g8H9i0J");
+	const LEAKED_TOKEN_PATTERN: &str = r"glpat-[A-Za-z0-9_-]{10,}";
+
+	let mask_guard = ResponseGuard {
+		rejection: Default::default(),
+		kind: ResponseGuardKind::Regex(RegexRules {
+			action: Action::Mask,
+			rules: vec![RegexRule::Regex {
+				pattern: regex::Regex::new(LEAKED_TOKEN_PATTERN).unwrap(),
+			}],
+		}),
+	};
+	let response_policies = |guard: ResponseGuard| LLMResponsePolicies {
+		prompt_guard: vec![guard],
+		streaming_prompt_guard_enabled: true,
+		..Default::default()
+	};
+	let llm_req = |streaming: bool| LLMRequest {
+		input_tokens: None,
+		input_format: InputFormat::Completions,
+		cache_convention: CacheTokenConvention::pending(),
+		request_model: "gpt-4o-mini".into(),
+		provider: Default::default(),
+		streaming,
+		params: Default::default(),
+		prompt: None,
+		provider_state: None,
+	};
+
+	let openai = AIProvider::OpenAI(openai::Provider {
+		model: None,
+		moderation: None,
+	});
+	let client = PolicyClient::new(setup_proxy_test("{}").unwrap().pi);
+
+	let json_body = serde_json::json!({
+		"id": "chatcmpl-test",
+		"object": "chat.completion",
+		"created": 1755008546,
+		"model": "gpt-4o-mini",
+		"choices": [{
+			"index": 0,
+			"message": {
+				"role": "assistant",
+				"content": format!("here is a token: {LEAKED_TOKEN} enjoy"),
+			},
+			"finish_reason": "stop",
+		}],
+		"usage": { "prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10 },
+	});
+	let mut resp = Response::new(Body::from(json_body.to_string()));
+	resp.headers_mut().insert(
+		::http::header::CONTENT_TYPE,
+		"application/json".parse().unwrap(),
+	);
+
+	let translated = openai
+		.process_response(
+			client.clone(),
+			llm_req(false),
+			response_policies(mask_guard.clone()),
+			None,
+			AsyncLog::default(),
+			llm::LogContentFields::default(),
+			None,
+			resp,
+		)
+		.await
+		.expect("non-streaming response should be masked, not rejected");
+	let body = translated.into_body().collect().await.unwrap().to_bytes();
+	let text = String::from_utf8(body.to_vec()).expect("non-streaming body should be valid UTF-8");
+	assert!(
+		!text.contains(LEAKED_TOKEN),
+		"non-streaming response leaked the secret:\n{text}"
+	);
+	assert!(
+		text.contains("<masked>"),
+		"non-streaming response was not masked:\n{text}"
+	);
+
+	let sse_body = format!(
+		"data: {}\n\ndata: [DONE]\n\n",
+		serde_json::json!({
+			"id": "chatcmpl-test",
+			"object": "chat.completion.chunk",
+			"choices": [{
+				"index": 0,
+				"delta": { "content": format!("here is a token: {LEAKED_TOKEN} enjoy") },
+			}],
+		})
+	);
+	let mut resp = Response::new(Body::from(sse_body));
+	resp.headers_mut().insert(
+		::http::header::CONTENT_TYPE,
+		"text/event-stream".parse().unwrap(),
+	);
+
+	let translated = openai
+		.process_response(
+			client,
+			llm_req(true),
+			response_policies(mask_guard),
+			None,
+			AsyncLog::default(),
+			llm::LogContentFields::default(),
+			None,
+			resp,
+		)
+		.await
+		.expect("streaming response should be masked, not rejected");
+	let body = translated.into_body().collect().await.unwrap().to_bytes();
+	let text = String::from_utf8(body.to_vec()).expect("streaming body should be valid UTF-8");
+	assert!(
+		!text.contains(LEAKED_TOKEN),
+		"streaming response leaked the secret:\n{text}"
+	);
+	assert!(
+		text.contains("<masked>"),
+		"streaming response was not masked:\n{text}"
+	);
+}
+
 #[test]
 fn setup_request_openai_applies_prefixed_path_without_host_override() {
 	let provider = AIProvider::OpenAI(openai::Provider {
